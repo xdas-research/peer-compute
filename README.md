@@ -3,7 +3,7 @@
 > Decentralized peer-to-peer compute platform for deploying Docker containers on trusted peer machines.
 
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://golang.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 ## Overview
 
@@ -19,7 +19,7 @@ Peer Compute enables developers to deploy Docker containers on trusted peer mach
                                               │
                                      ┌────────▼────────┐
                                      │     Gateway     │
-                                     │ (peercompute.xdastechnology.com)│
+                                     │ (Public Access) │
                                      └────────┬────────┘
                                               │
                                         HTTPS │
@@ -36,6 +36,7 @@ Peer Compute enables developers to deploy Docker containers on trusted peer mach
 - **Container Isolation**: Strict resource limits, no host mounts, non-privileged
 - **Secure by Default**: Ed25519 cryptographic identities, Noise encryption
 - **Simple CLI**: Deploy containers with a single command
+- **Public Gateway**: Expose containers via subdomain-based routing
 
 ## Quick Start
 
@@ -43,7 +44,6 @@ Peer Compute enables developers to deploy Docker containers on trusted peer mach
 
 - Go 1.22 or later
 - Docker installed and running
-- Linux or macOS (Windows support coming)
 
 ### Installation
 
@@ -82,7 +82,11 @@ Exchange peer IDs out-of-band (Signal, email, etc.) and add them:
 On machines providing compute resources:
 
 ```bash
-./bin/peercomputed --port 9000 --max-cpu 4000 --max-memory 4G
+# Without gateway (local access only)
+./bin/peercomputed --port 9000
+
+# With gateway (public access)
+./bin/peercomputed --port 9000 --gateway your-gateway.com:8443
 ```
 
 ### Deploy Containers
@@ -149,14 +153,6 @@ Stop a deployment.
 peerctl stop <deployment-id> [--force]
 ```
 
-### `peerctl status`
-
-Get deployment status.
-
-```bash
-peerctl status [deployment-id]
-```
-
 ## Architecture
 
 See [docs/architecture.md](docs/architecture.md) for detailed system design.
@@ -183,7 +179,7 @@ For public access to deployed containers:
 
 ```bash
 ./bin/gateway \
-  --domain peercompute.xdastechnology.com \
+  --domain peercompute.example.com \
   --acme-email admin@example.com \
   --https-port 443 \
   --tunnel-port 8443
@@ -194,19 +190,6 @@ The gateway:
 - Assigns subdomains per deployment
 - Routes traffic through reverse tunnels
 - Never runs user containers
-
-## Development
-
-```bash
-# Run tests
-go test ./...
-
-# Build with version info
-go build -ldflags "-X main.Version=1.0.0 -X main.Commit=$(git rev-parse HEAD)" ./cmd/...
-
-# Lint
-golangci-lint run
-```
 
 ## Project Structure
 
@@ -222,8 +205,11 @@ peer-compute/
 │   ├── protocol/         # Message types
 │   ├── runtime/          # Docker execution
 │   ├── scheduler/        # Deployment management
-│   ├── security/         # Signing/verification
+│   ├── handler/          # P2P request handlers
+│   ├── client/           # P2P client
 │   └── tunnel/           # Reverse tunnels
+├── examples/
+│   └── express-hello/    # Example Express.js app
 ├── docs/
 │   ├── architecture.md
 │   ├── threat-model.md
@@ -245,7 +231,7 @@ Contributions are welcome! Please read our contributing guidelines before submit
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+Peer Compute is an open-source project licensed under **Apache License 2.0**. See [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
