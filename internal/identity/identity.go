@@ -68,7 +68,7 @@ func Generate() (*Identity, error) {
 }
 
 // Load reads an identity from a key file.
-// The key file contains the raw Ed25519 private key bytes.
+// The key file contains the marshaled Ed25519 private key bytes.
 func Load(path string) (*Identity, error) {
 	// Read the key file
 	// SECURITY: The file should have restricted permissions (0600)
@@ -83,10 +83,10 @@ func Load(path string) (*Identity, error) {
 		return nil, fmt.Errorf("failed to decode key file (expected hex): %w", err)
 	}
 
-	// Unmarshal the private key
-	privKey, err := crypto.UnmarshalEd25519PrivateKey(rawKey)
+	// Unmarshal the private key (uses protobuf format to match Save)
+	privKey, err := crypto.UnmarshalPrivateKey(rawKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal Ed25519 private key: %w", err)
+		return nil, fmt.Errorf("failed to unmarshal private key: %w", err)
 	}
 
 	// Derive public key from private key
