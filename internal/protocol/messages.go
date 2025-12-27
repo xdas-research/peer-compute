@@ -81,6 +81,9 @@ type DeployResponse struct {
 	// DeploymentID is the unique identifier for this deployment
 	DeploymentID string `json:"deployment_id,omitempty"`
 
+	// Success indicates if the deployment was successful
+	Success bool `json:"success"`
+
 	// Status is the deployment status
 	Status DeploymentStatus `json:"status"`
 
@@ -89,6 +92,9 @@ type DeployResponse struct {
 
 	// ContainerID is the Docker container ID
 	ContainerID string `json:"container_id,omitempty"`
+
+	// Message is a human-readable message
+	Message string `json:"message,omitempty"`
 
 	// Error is the error message if the deployment failed
 	Error string `json:"error,omitempty"`
@@ -131,6 +137,9 @@ type StopResponse struct {
 	// Success indicates if the stop was successful
 	Success bool `json:"success"`
 
+	// Message is a human-readable message
+	Message string `json:"message,omitempty"`
+
 	// Error is the error message if the stop failed
 	Error string `json:"error,omitempty"`
 }
@@ -152,23 +161,23 @@ type LogEntry struct {
 
 // StatusRequest is a request for deployment status.
 type StatusRequest struct {
-	// DeploymentID is the deployment to query
+	// DeploymentID is the deployment to query (empty for all)
 	DeploymentID string `json:"deployment_id"`
 }
 
-// StatusResponse is the response to a status request.
-type StatusResponse struct {
+// DeploymentStatusInfo contains status info for a single deployment.
+type DeploymentStatusInfo struct {
 	// DeploymentID is the deployment ID
 	DeploymentID string `json:"deployment_id"`
 
 	// Status is the current status
-	Status DeploymentStatus `json:"status"`
+	Status string `json:"status"`
 
 	// Image is the container image
 	Image string `json:"image"`
 
 	// StartedAt is when the container started
-	StartedAt int64 `json:"started_at,omitempty"`
+	StartedAt time.Time `json:"started_at,omitempty"`
 
 	// ExposedURL is the public URL if exposed
 	ExposedURL string `json:"exposed_url,omitempty"`
@@ -178,6 +187,12 @@ type StatusResponse struct {
 
 	// Error is set if the deployment failed
 	Error string `json:"error,omitempty"`
+}
+
+// StatusResponse is the response to a status request.
+type StatusResponse struct {
+	// Deployments contains status for one or more deployments
+	Deployments []DeploymentStatusInfo `json:"deployments"`
 }
 
 // ResourceUsage contains resource usage metrics.

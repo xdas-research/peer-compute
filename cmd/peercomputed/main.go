@@ -23,7 +23,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/xdas-research/peer-compute/internal/handler"
 	"github.com/xdas-research/peer-compute/internal/identity"
 	"github.com/xdas-research/peer-compute/internal/p2p"
 	"github.com/xdas-research/peer-compute/internal/runtime"
@@ -156,7 +156,8 @@ func run(ctx context.Context, cfg *Config) error {
 
 	// 6. Register protocol handlers
 	log.Println("Registering protocol handlers...")
-	registerHandlers(host, sched, id)
+	h := handler.NewHandler(sched, rt, trust, host.ID())
+	h.RegisterHandlers(host)
 
 	// 7. Start discovery
 	log.Println("Starting peer discovery...")
@@ -169,8 +170,15 @@ func run(ctx context.Context, cfg *Config) error {
 	// 8. Connect to known peers
 	go connectToKnownPeers(ctx, host, trust)
 
+	log.Println("")
+	log.Println("========================================")
 	log.Println("Peer Compute Daemon ready")
 	log.Printf("Peer ID: %s", id.PeerID)
+	log.Println("========================================")
+	log.Println("")
+	log.Println("Add this peer ID to your CLI with:")
+	log.Printf("  peerctl peers add %s", id.PeerID)
+	log.Println("")
 
 	// Wait for shutdown
 	<-ctx.Done()
@@ -185,38 +193,6 @@ func run(ctx context.Context, cfg *Config) error {
 	}
 
 	return nil
-}
-
-func registerHandlers(host *p2p.Host, sched *scheduler.Scheduler, id *identity.Identity) {
-	// Deploy handler
-	host.SetStreamHandler("/peercompute/deploy/1.0.0", func(stream network.Stream) {
-		// Handle deployment request
-		// This would:
-		// 1. Read and verify the request
-		// 2. Check if requester is trusted
-		// 3. Validate resources
-		// 4. Schedule the deployment
-		// 5. Send response
-		defer stream.Close()
-	})
-
-	// Logs handler
-	host.SetStreamHandler("/peercompute/logs/1.0.0", func(stream network.Stream) {
-		// Handle log streaming request
-		defer stream.Close()
-	})
-
-	// Status handler
-	host.SetStreamHandler("/peercompute/status/1.0.0", func(stream network.Stream) {
-		// Handle status request
-		defer stream.Close()
-	})
-
-	// Stop handler
-	host.SetStreamHandler("/peercompute/stop/1.0.0", func(stream network.Stream) {
-		// Handle stop request
-		defer stream.Close()
-	})
 }
 
 func connectToKnownPeers(ctx context.Context, host *p2p.Host, trust *p2p.TrustManager) {
