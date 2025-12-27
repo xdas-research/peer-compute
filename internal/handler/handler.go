@@ -16,14 +16,16 @@ import (
 	"github.com/xdas-research/peer-compute/internal/protocol"
 	"github.com/xdas-research/peer-compute/internal/runtime"
 	"github.com/xdas-research/peer-compute/internal/scheduler"
+	"github.com/xdas-research/peer-compute/internal/tunnel"
 )
 
 // Handler processes incoming P2P protocol requests.
 type Handler struct {
-	scheduler *scheduler.Scheduler
-	runtime   *runtime.Runtime
-	trust     *p2p.TrustManager
-	peerID    peer.ID
+	scheduler    *scheduler.Scheduler
+	runtime      *runtime.Runtime
+	trust        *p2p.TrustManager
+	peerID       peer.ID
+	tunnelClient *tunnel.Client
 }
 
 // NewHandler creates a new protocol handler.
@@ -34,6 +36,11 @@ func NewHandler(sched *scheduler.Scheduler, rt *runtime.Runtime, trust *p2p.Trus
 		trust:     trust,
 		peerID:    peerID,
 	}
+}
+
+// SetTunnelClient sets the tunnel client for registering deployments with the gateway.
+func (h *Handler) SetTunnelClient(tc *tunnel.Client) {
+	h.tunnelClient = tc
 }
 
 // RegisterHandlers registers all protocol handlers on the host.
@@ -96,11 +103,25 @@ func (h *Handler) handleDeploy(stream network.Stream) {
 
 	log.Printf("[DEPLOY] Success! Deployment: %s, Container: %s", result.ID, result.ContainerID[:12])
 
+	// Register with gateway if tunnel client is available and port is exposed
+	var exposedURL string
+	if h.tunnelClient != nil && h.tunnelClient.IsConnected() && req.ExposePort > 0 {
+		log.Printf("[DEPLOY] Registering with gateway for public access...")
+		url, err := h.tunnelClient.RegisterDeployment(result.ID, req.ExposePort)
+		if err != nil {
+			log.Printf("[DEPLOY] Warning: failed to register with gateway: %v", err)
+		} else {
+			exposedURL = url
+			log.Printf("[DEPLOY] Public URL: %s", exposedURL)
+		}
+	}
+
 	// Send response
 	resp := protocol.DeployResponse{
 		Success:      true,
 		DeploymentID: result.ID,
 		ContainerID:  result.ContainerID,
+		ExposedURL:   exposedURL,
 		Message:      "Container deployed successfully",
 	}
 	writeJSON(stream, resp)
@@ -199,6 +220,11 @@ func (h *Handler) handleStop(stream network.Stream) {
 		log.Printf("[STOP] Failed to read request: %v", err)
 		sendError(stream, "invalid request format")
 		return
+	}
+
+	// Unregister from gateway if tunnel client is available
+	if h.tunnelClient != nil && h.tunnelClient.IsConnected() {
+		h.tunnelClient.UnregisterDeployment(req.DeploymentID)
 	}
 
 	// Stop via scheduler

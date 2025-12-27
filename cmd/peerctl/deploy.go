@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -107,13 +108,61 @@ Examples:
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 
-			// Connect to peer and send request
-			// For MVP, we'll simulate the deployment
-			_ = ctx
-			_ = req
+			// Create P2P host
+			host, err := p2p.NewHost(ctx, &p2p.Config{
+				Identity:     id,
+				ListenPort:   0, // Random port
+				TrustManager: tm,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to create P2P host: %w", err)
+			}
+			defer host.Close()
 
-			fmt.Println("\n✓ Deployment submitted")
-			fmt.Printf("  Deployment ID: %s\n", req.RequestID)
+			// Parse target peer address
+			addrInfo, err := p2p.ParseAddrInfo(targetPeer.ID.String(), targetPeer.Addresses)
+			if err != nil {
+				return fmt.Errorf("failed to parse peer address: %w", err)
+			}
+
+			// Connect to the peer
+			fmt.Print("\nConnecting to peer...")
+			if err := host.Connect(ctx, addrInfo); err != nil {
+				return fmt.Errorf("\nfailed to connect to peer: %w", err)
+			}
+			fmt.Println(" connected!")
+
+			// Open stream and send deploy request
+			fmt.Print("Sending deployment request...")
+			stream, err := host.NewStream(ctx, targetPeer.ID, "/peercompute/deploy/1.0.0")
+			if err != nil {
+				return fmt.Errorf("\nfailed to open stream: %w", err)
+			}
+			defer stream.Close()
+
+			// Send request
+			encoder := json.NewEncoder(stream)
+			if err := encoder.Encode(req); err != nil {
+				return fmt.Errorf("\nfailed to send request: %w", err)
+			}
+
+			// Read response
+			var resp protocol.DeployResponse
+			decoder := json.NewDecoder(stream)
+			if err := decoder.Decode(&resp); err != nil {
+				return fmt.Errorf("\nfailed to read response: %w", err)
+			}
+
+			if !resp.Success {
+				return fmt.Errorf("\ndeployment failed: %s", resp.Message)
+			}
+
+			fmt.Println(" success!")
+			fmt.Println("\n✓ Deployment successful!")
+			fmt.Printf("  Deployment ID: %s\n", resp.DeploymentID)
+			if resp.ContainerID != "" {
+				fmt.Printf("  Container ID: %s\n", resp.ContainerID[:12])
+			}
 			fmt.Println("\nUse 'peerctl logs <deployment-id>' to view logs")
 			fmt.Println("Use 'peerctl stop <deployment-id>' to stop the deployment")
 

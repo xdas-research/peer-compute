@@ -10,11 +10,14 @@
 package tunnel
 
 import (
+	"bufio"
 	"context"
-	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -28,39 +31,42 @@ const (
 
 	// HeartbeatInterval is the interval for sending heartbeats
 	HeartbeatInterval = 30 * time.Second
-
-	// HeartbeatTimeout is the timeout for heartbeat responses
-	HeartbeatTimeout = 10 * time.Second
 )
+
+// TunnelMessage is the JSON protocol for tunnel communication
+type TunnelMessage struct {
+	Type         string            `json:"type"` // "register", "unregister", "request", "response"
+	DeploymentID string            `json:"deployment_id,omitempty"`
+	Port         int               `json:"port,omitempty"`
+	PeerID       string            `json:"peer_id,omitempty"`
+	RequestID    string            `json:"request_id,omitempty"`
+	Method       string            `json:"method,omitempty"`
+	Path         string            `json:"path,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
+	Body         []byte            `json:"body,omitempty"`
+	StatusCode   int               `json:"status_code,omitempty"`
+}
 
 // Client is a reverse tunnel client that runs on the provider.
 type Client struct {
 	gatewayAddr string
-	tlsConfig   *tls.Config
 	peerID      string
-	deployments map[string]*TunnelBinding
-	mu          sync.RWMutex
 	conn        net.Conn
+	reader      *bufio.Reader
+	writer      *bufio.Writer
+	mu          sync.Mutex
+	routes      map[string]int // deploymentID -> container port
 	ctx         context.Context
 	cancel      context.CancelFunc
-}
-
-// TunnelBinding represents a binding between a deployment and a tunnel.
-type TunnelBinding struct {
-	DeploymentID string
-	ContainerID  string
-	LocalPort    int
-	AssignedURL  string
+	connected   bool
 }
 
 // ClientConfig contains configuration for the tunnel client.
 type ClientConfig struct {
-	// GatewayAddr is the address of the gateway server
+	// GatewayAddr is the address of the gateway server (host:port)
 	GatewayAddr string
 	// PeerID is the peer ID of this provider
 	PeerID string
-	// TLSConfig is the TLS configuration for the connection
-	TLSConfig *tls.Config
 }
 
 // NewClient creates a new tunnel client.
@@ -68,9 +74,8 @@ func NewClient(cfg *ClientConfig) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Client{
 		gatewayAddr: cfg.GatewayAddr,
-		tlsConfig:   cfg.TLSConfig,
 		peerID:      cfg.PeerID,
-		deployments: make(map[string]*TunnelBinding),
+		routes:      make(map[string]int),
 		ctx:         ctx,
 		cancel:      cancel,
 	}
@@ -78,32 +83,23 @@ func NewClient(cfg *ClientConfig) *Client {
 
 // Connect establishes a connection to the gateway.
 func (c *Client) Connect(ctx context.Context) error {
-	// Use TLS for encrypted connection
-	var conn net.Conn
-	var err error
+	log.Printf("[TUNNEL] Connecting to gateway: %s", c.gatewayAddr)
 
-	if c.tlsConfig != nil {
-		conn, err = tls.Dial("tcp", c.gatewayAddr, c.tlsConfig)
-	} else {
-		// For development, allow non-TLS connections
-		conn, err = net.Dial("tcp", c.gatewayAddr)
-	}
-
+	conn, err := net.DialTimeout("tcp", c.gatewayAddr, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("failed to connect to gateway: %w", err)
 	}
 
 	c.mu.Lock()
 	c.conn = conn
+	c.reader = bufio.NewReader(conn)
+	c.writer = bufio.NewWriter(conn)
+	c.connected = true
 	c.mu.Unlock()
 
-	// Send authentication/registration
-	if err := c.authenticate(); err != nil {
-		conn.Close()
-		return fmt.Errorf("authentication failed: %w", err)
-	}
+	log.Printf("[TUNNEL] Connected to gateway!")
 
-	// Start heartbeat and message handling
+	// Start message handler
 	go c.handleMessages()
 	go c.heartbeat()
 
@@ -111,44 +107,50 @@ func (c *Client) Connect(ctx context.Context) error {
 }
 
 // RegisterDeployment registers a deployment for exposure via the tunnel.
-func (c *Client) RegisterDeployment(deploymentID, containerID string, localPort int) (*TunnelBinding, error) {
+func (c *Client) RegisterDeployment(deploymentID string, containerPort int) (string, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		return nil, fmt.Errorf("not connected to gateway")
+	if !c.connected || c.conn == nil {
+		c.mu.Unlock()
+		return "", fmt.Errorf("not connected to gateway")
 	}
+	c.mu.Unlock()
 
-	// Send registration request to gateway
-	// In production, this would use a proper protocol
-	binding := &TunnelBinding{
+	// Send registration message
+	msg := TunnelMessage{
+		Type:         "register",
 		DeploymentID: deploymentID,
-		ContainerID:  containerID,
-		LocalPort:    localPort,
-		// Gateway will assign the URL
+		Port:         containerPort,
+		PeerID:       c.peerID,
 	}
 
-	c.deployments[deploymentID] = binding
+	if err := c.send(&msg); err != nil {
+		return "", fmt.Errorf("failed to send registration: %w", err)
+	}
 
-	// TODO: Send registration message to gateway and wait for response
-	// For MVP, we'll simulate the URL assignment
-	binding.AssignedURL = fmt.Sprintf("https://%s.peercompute.xdastechnology.com", deploymentID)
+	c.mu.Lock()
+	c.routes[deploymentID] = containerPort
+	c.mu.Unlock()
 
-	return binding, nil
+	log.Printf("[TUNNEL] Registered deployment %s on port %d", deploymentID, containerPort)
+
+	// Return the URL (gateway will confirm, but we can predict it)
+	return fmt.Sprintf("https://%s.peercompute.xdastechnology.com", deploymentID), nil
 }
 
 // UnregisterDeployment removes a deployment from the tunnel.
 func (c *Client) UnregisterDeployment(deploymentID string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if _, ok := c.deployments[deploymentID]; !ok {
-		return fmt.Errorf("deployment %s not registered", deploymentID)
+	msg := TunnelMessage{
+		Type:         "unregister",
+		DeploymentID: deploymentID,
 	}
 
-	delete(c.deployments, deploymentID)
+	if err := c.send(&msg); err != nil {
+		return fmt.Errorf("failed to send unregistration: %w", err)
+	}
 
-	// TODO: Send unregistration message to gateway
+	c.mu.Lock()
+	delete(c.routes, deploymentID)
+	c.mu.Unlock()
 
 	return nil
 }
@@ -160,33 +162,142 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.connected = false
 	if c.conn != nil {
 		return c.conn.Close()
 	}
 	return nil
 }
 
-// authenticate sends authentication to the gateway.
-func (c *Client) authenticate() error {
-	// TODO: Implement proper authentication protocol
-	// For MVP, we just send the peer ID
-	return nil
+// IsConnected returns whether the client is connected to the gateway.
+func (c *Client) IsConnected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connected
 }
 
-// handleMessages processes incoming messages from the gateway.
+func (c *Client) send(msg *TunnelMessage) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.writer == nil {
+		return fmt.Errorf("not connected")
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	c.writer.Write(data)
+	c.writer.WriteByte('\n')
+	return c.writer.Flush()
+}
+
 func (c *Client) handleMessages() {
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		default:
-			// Read messages from gateway
-			// Forward traffic to appropriate container
+		}
+
+		c.mu.Lock()
+		reader := c.reader
+		c.mu.Unlock()
+
+		if reader == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("[TUNNEL] Read error: %v", err)
+			}
+			c.mu.Lock()
+			c.connected = false
+			c.mu.Unlock()
+			return
+		}
+
+		var msg TunnelMessage
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			log.Printf("[TUNNEL] Invalid message: %v", err)
+			continue
+		}
+
+		switch msg.Type {
+		case "registered":
+			log.Printf("[TUNNEL] Gateway confirmed registration: %s", msg.DeploymentID)
+
+		case "request":
+			// Handle incoming HTTP request from gateway
+			go c.handleRequest(&msg)
 		}
 	}
 }
 
-// heartbeat sends periodic heartbeats to keep the connection alive.
+func (c *Client) handleRequest(msg *TunnelMessage) {
+	c.mu.Lock()
+	port, ok := c.routes[msg.DeploymentID]
+	c.mu.Unlock()
+
+	if !ok {
+		c.sendResponse(msg.RequestID, 404, nil, []byte("Deployment not found"))
+		return
+	}
+
+	// Forward request to local container
+	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, msg.Path)
+	
+	req, err := http.NewRequest(msg.Method, url, nil)
+	if err != nil {
+		c.sendResponse(msg.RequestID, 500, nil, []byte(err.Error()))
+		return
+	}
+
+	// Copy headers
+	for k, v := range msg.Headers {
+		req.Header.Set(k, v)
+	}
+
+	// Make request
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[TUNNEL] Request failed: %v", err)
+		c.sendResponse(msg.RequestID, 502, nil, []byte("Failed to reach container: "+err.Error()))
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, _ := io.ReadAll(resp.Body)
+
+	// Convert headers
+	headers := make(map[string]string)
+	for k, v := range resp.Header {
+		if len(v) > 0 {
+			headers[k] = v[0]
+		}
+	}
+
+	c.sendResponse(msg.RequestID, resp.StatusCode, headers, body)
+}
+
+func (c *Client) sendResponse(requestID string, statusCode int, headers map[string]string, body []byte) {
+	msg := TunnelMessage{
+		Type:       "response",
+		RequestID:  requestID,
+		StatusCode: statusCode,
+		Headers:    headers,
+		Body:       body,
+	}
+	c.send(&msg)
+}
+
 func (c *Client) heartbeat() {
 	ticker := time.NewTicker(HeartbeatInterval)
 	defer ticker.Stop()
@@ -196,38 +307,13 @@ func (c *Client) heartbeat() {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
-			// Send heartbeat
-			c.mu.RLock()
-			conn := c.conn
-			c.mu.RUnlock()
-
-			if conn != nil {
-				// TODO: Send heartbeat message
+			// Simple heartbeat - just check connection is alive
+			c.mu.Lock()
+			connected := c.connected
+			c.mu.Unlock()
+			if !connected {
+				return
 			}
 		}
 	}
-}
-
-// proxyConnection proxies traffic between the gateway and a local container.
-func (c *Client) proxyConnection(remote net.Conn, localPort int) error {
-	local, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
-	if err != nil {
-		return fmt.Errorf("failed to connect to container: %w", err)
-	}
-	defer local.Close()
-
-	// Bidirectional copy
-	errCh := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(remote, local)
-		errCh <- err
-	}()
-	go func() {
-		_, err := io.Copy(local, remote)
-		errCh <- err
-	}()
-
-	// Wait for either direction to complete/error
-	<-errCh
-	return nil
 }

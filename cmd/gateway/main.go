@@ -9,14 +9,20 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -92,7 +98,7 @@ func run(ctx context.Context, cfg *Config) error {
 
 	// Start tunnel listener
 	go func() {
-		if err := tunnelMgr.ListenAndServe(fmt.Sprintf(":%d", cfg.TunnelPort)); err != nil {
+		if err := tunnelMgr.ListenAndServe(fmt.Sprintf(":%d", cfg.TunnelPort), cfg.BaseDomain); err != nil {
 			log.Printf("Tunnel server error: %v", err)
 		}
 	}()
@@ -101,7 +107,6 @@ func run(ctx context.Context, cfg *Config) error {
 	handler := NewGatewayHandler(tunnelMgr, cfg)
 
 	// Add middleware
-	handler = withRateLimit(handler, cfg.RateLimitRPS)
 	handler = withLogging(handler)
 	handler = withRecovery(handler)
 
@@ -169,6 +174,7 @@ func run(ctx context.Context, cfg *Config) error {
 	}
 
 	log.Printf("Gateway ready. Base domain: %s", cfg.BaseDomain)
+	log.Printf("Tunnel server listening on :%d", cfg.TunnelPort)
 
 	// Wait for shutdown
 	<-ctx.Done()
@@ -188,38 +194,199 @@ func run(ctx context.Context, cfg *Config) error {
 	return nil
 }
 
+// TunnelMessage is the JSON protocol for tunnel communication
+type TunnelMessage struct {
+	Type         string `json:"type"` // "register", "unregister", "request", "response"
+	DeploymentID string `json:"deployment_id,omitempty"`
+	Port         int    `json:"port,omitempty"`
+	PeerID       string `json:"peer_id,omitempty"`
+	RequestID    string `json:"request_id,omitempty"`
+	Method       string `json:"method,omitempty"`
+	Path         string `json:"path,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
+	Body         []byte `json:"body,omitempty"`
+	StatusCode   int    `json:"status_code,omitempty"`
+}
+
 // TunnelManager manages reverse tunnel connections from providers.
 type TunnelManager struct {
-	// tunnels maps peer ID to tunnel connection
-	tunnels map[string]*TunnelConn
+	mu       sync.RWMutex
+	tunnels  map[string]*TunnelConn      // peerID -> tunnel
+	routes   map[string]*TunnelConn      // deploymentID -> tunnel
+	listener net.Listener
 }
 
 type TunnelConn struct {
 	PeerID     string
+	Conn       net.Conn
+	Reader     *bufio.Reader
+	Writer     *bufio.Writer
 	Routes     map[string]int // deployment ID -> local port
-	LastActive time.Time
+	mu         sync.Mutex
+	pending    map[string]chan *TunnelMessage // requestID -> response channel
 }
 
 func NewTunnelManager() *TunnelManager {
 	return &TunnelManager{
 		tunnels: make(map[string]*TunnelConn),
+		routes:  make(map[string]*TunnelConn),
 	}
 }
 
-func (tm *TunnelManager) ListenAndServe(addr string) error {
-	// Listen for incoming tunnel connections
-	// This is simplified for MVP
+func (tm *TunnelManager) ListenAndServe(addr string, baseDomain string) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen: %w", err)
+	}
+	tm.listener = listener
 	log.Printf("Tunnel server listening on %s", addr)
-	select {} // Block forever in MVP
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("Accept error: %v", err)
+			continue
+		}
+		go tm.handleTunnelConn(conn, baseDomain)
+	}
+}
+
+func (tm *TunnelManager) handleTunnelConn(conn net.Conn, baseDomain string) {
+	log.Printf("New tunnel connection from %s", conn.RemoteAddr())
+	
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+	
+	tc := &TunnelConn{
+		Conn:    conn,
+		Reader:  reader,
+		Writer:  writer,
+		Routes:  make(map[string]int),
+		pending: make(map[string]chan *TunnelMessage),
+	}
+
+	// Read messages from provider
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Tunnel read error: %v", err)
+			}
+			break
+		}
+
+		var msg TunnelMessage
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			log.Printf("Invalid tunnel message: %v", err)
+			continue
+		}
+
+		switch msg.Type {
+		case "register":
+			tc.PeerID = msg.PeerID
+			tc.Routes[msg.DeploymentID] = msg.Port
+			
+			tm.mu.Lock()
+			tm.tunnels[msg.PeerID] = tc
+			tm.routes[msg.DeploymentID] = tc
+			tm.mu.Unlock()
+			
+			url := fmt.Sprintf("https://%s.%s", msg.DeploymentID, baseDomain)
+			log.Printf("Registered deployment %s -> port %d (URL: %s)", msg.DeploymentID, msg.Port, url)
+			
+			// Send confirmation
+			resp := TunnelMessage{
+				Type:         "registered",
+				DeploymentID: msg.DeploymentID,
+			}
+			tc.Send(&resp)
+
+		case "unregister":
+			tm.mu.Lock()
+			delete(tm.routes, msg.DeploymentID)
+			delete(tc.Routes, msg.DeploymentID)
+			tm.mu.Unlock()
+			log.Printf("Unregistered deployment %s", msg.DeploymentID)
+
+		case "response":
+			tc.mu.Lock()
+			if ch, ok := tc.pending[msg.RequestID]; ok {
+				ch <- &msg
+				delete(tc.pending, msg.RequestID)
+			}
+			tc.mu.Unlock()
+		}
+	}
+
+	// Cleanup on disconnect
+	tm.mu.Lock()
+	if tc.PeerID != "" {
+		delete(tm.tunnels, tc.PeerID)
+	}
+	for depID := range tc.Routes {
+		delete(tm.routes, depID)
+	}
+	tm.mu.Unlock()
+	
+	conn.Close()
+	log.Printf("Tunnel disconnected: %s", conn.RemoteAddr())
+}
+
+func (tc *TunnelConn) Send(msg *TunnelMessage) error {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	
+	tc.Writer.Write(data)
+	tc.Writer.WriteByte('\n')
+	return tc.Writer.Flush()
+}
+
+func (tc *TunnelConn) Request(msg *TunnelMessage, timeout time.Duration) (*TunnelMessage, error) {
+	ch := make(chan *TunnelMessage, 1)
+	
+	tc.mu.Lock()
+	tc.pending[msg.RequestID] = ch
+	tc.mu.Unlock()
+	
+	if err := tc.Send(msg); err != nil {
+		tc.mu.Lock()
+		delete(tc.pending, msg.RequestID)
+		tc.mu.Unlock()
+		return nil, err
+	}
+	
+	select {
+	case resp := <-ch:
+		return resp, nil
+	case <-time.After(timeout):
+		tc.mu.Lock()
+		delete(tc.pending, msg.RequestID)
+		tc.mu.Unlock()
+		return nil, fmt.Errorf("request timeout")
+	}
 }
 
 func (tm *TunnelManager) Close() {
-	// Close all tunnel connections
+	if tm.listener != nil {
+		tm.listener.Close()
+	}
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	for _, tc := range tm.tunnels {
+		tc.Conn.Close()
+	}
 }
 
-func (tm *TunnelManager) GetTunnel(subdomain string) (*TunnelConn, bool) {
-	// Look up tunnel by subdomain
-	return nil, false
+func (tm *TunnelManager) GetTunnel(deploymentID string) (*TunnelConn, bool) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	tc, ok := tm.routes[deploymentID]
+	return tc, ok
 }
 
 // GatewayHandler routes incoming HTTP requests to containers via tunnels.
@@ -247,7 +414,7 @@ func (h *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Find the tunnel for this subdomain
 	tunnel, ok := h.tunnels.GetTunnel(subdomain)
 	if !ok {
-		http.Error(w, "Deployment not found", http.StatusNotFound)
+		http.Error(w, fmt.Sprintf("Deployment '%s' not found", subdomain), http.StatusNotFound)
 		return
 	}
 
@@ -262,9 +429,10 @@ func (h *GatewayHandler) serveGatewayInfo(w http.ResponseWriter, r *http.Request
 <head>
     <title>Peer Compute Gateway</title>
     <style>
-        body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
-        h1 { color: #333; }
-        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
+        body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; background: #0a0a0a; color: #fff; }
+        h1 { color: #00ff88; }
+        code { background: #1a1a1a; padding: 2px 6px; border-radius: 3px; color: #00ff88; }
+        a { color: #00aaff; }
     </style>
 </head>
 <body>
@@ -277,36 +445,73 @@ func (h *GatewayHandler) serveGatewayInfo(w http.ResponseWriter, r *http.Request
 </html>`, h.cfg.BaseDomain, h.cfg.BaseDomain)
 }
 
-func (h *GatewayHandler) proxyRequest(w http.ResponseWriter, r *http.Request, tunnel *TunnelConn, subdomain string) {
-	// Forward request through tunnel
-	// This is simplified for MVP
-	http.Error(w, "Proxy not implemented", http.StatusNotImplemented)
+func (h *GatewayHandler) proxyRequest(w http.ResponseWriter, r *http.Request, tunnel *TunnelConn, deploymentID string) {
+	// Read request body
+	var body []byte
+	if r.Body != nil {
+		body, _ = io.ReadAll(r.Body)
+	}
+
+	// Build headers map
+	headers := make(map[string]string)
+	for k, v := range r.Header {
+		if len(v) > 0 {
+			headers[k] = v[0]
+		}
+	}
+
+	// Create request message
+	requestID := fmt.Sprintf("%d", time.Now().UnixNano())
+	msg := &TunnelMessage{
+		Type:         "request",
+		RequestID:    requestID,
+		DeploymentID: deploymentID,
+		Method:       r.Method,
+		Path:         r.URL.RequestURI(),
+		Headers:      headers,
+		Body:         body,
+	}
+
+	// Send request and wait for response
+	resp, err := tunnel.Request(msg, 30*time.Second)
+	if err != nil {
+		log.Printf("Proxy error for %s: %v", deploymentID, err)
+		http.Error(w, "Gateway error: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	// Write response headers
+	for k, v := range resp.Headers {
+		w.Header().Set(k, v)
+	}
+	
+	if resp.StatusCode > 0 {
+		w.WriteHeader(resp.StatusCode)
+	}
+	
+	if len(resp.Body) > 0 {
+		w.Write(resp.Body)
+	}
 }
 
 func extractSubdomain(host, baseDomain string) string {
 	// Remove port if present
-	for i := 0; i < len(host); i++ {
-		if host[i] == ':' {
-			host = host[:i]
-			break
-		}
+	if idx := strings.Index(host, ":"); idx != -1 {
+		host = host[:idx]
 	}
 
 	suffix := "." + baseDomain
-	if len(host) > len(suffix) && host[len(host)-len(suffix):] == suffix {
-		return host[:len(host)-len(suffix)]
+	if strings.HasSuffix(host, suffix) {
+		subdomain := host[:len(host)-len(suffix)]
+		// Ignore "www" subdomain
+		if subdomain != "www" && subdomain != "" {
+			return subdomain
+		}
 	}
 	return ""
 }
 
 // Middleware
-
-func withRateLimit(next http.Handler, rps int) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Simple rate limiting (would use token bucket in production)
-		next.ServeHTTP(w, r)
-	})
-}
 
 func withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

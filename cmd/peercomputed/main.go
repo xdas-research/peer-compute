@@ -3,15 +3,6 @@
 // peercomputed is the provider agent that runs on machines offering compute
 // resources. It handles deployment requests, container execution, and tunnel
 // management.
-//
-// Key responsibilities:
-// - Generate and persist cryptographic identity
-// - Join P2P network and discover other peers
-// - Accept deployment requests from trusted peers only
-// - Execute containers with strict security isolation
-// - Open reverse tunnels for exposed services
-// - Stream logs and status updates
-// - Auto-cleanup on exit
 package main
 
 import (
@@ -28,6 +19,7 @@ import (
 	"github.com/xdas-research/peer-compute/internal/p2p"
 	"github.com/xdas-research/peer-compute/internal/runtime"
 	"github.com/xdas-research/peer-compute/internal/scheduler"
+	"github.com/xdas-research/peer-compute/internal/tunnel"
 )
 
 var (
@@ -51,11 +43,9 @@ func main() {
 	log.Printf("Peer Compute Daemon %s (commit: %s)", Version, Commit)
 	log.Printf("Starting peercomputed...")
 
-	// Create context that cancels on shutdown signals
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle shutdown signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -64,7 +54,6 @@ func main() {
 		cancel()
 	}()
 
-	// Run the daemon
 	if err := run(ctx, cfg); err != nil {
 		log.Fatalf("Fatal error: %v", err)
 	}
@@ -76,7 +65,7 @@ func parseFlags() *Config {
 	cfg := &Config{}
 
 	flag.IntVar(&cfg.ListenPort, "port", 9000, "P2P listen port")
-	flag.StringVar(&cfg.GatewayAddr, "gateway", "", "Gateway address for tunnel connections")
+	flag.StringVar(&cfg.GatewayAddr, "gateway", "", "Gateway address for tunnel connections (e.g., peercompute.xdastechnology.com:8443)")
 	flag.Int64Var(&cfg.MaxCPU, "max-cpu", 4000, "Maximum CPU in millicores")
 	flag.Int64Var(&cfg.MaxMemory, "max-memory", 4*1024*1024*1024, "Maximum memory in bytes")
 	flag.IntVar(&cfg.MaxDeploys, "max-deploys", 10, "Maximum concurrent deployments")
@@ -113,7 +102,6 @@ func run(ctx context.Context, cfg *Config) error {
 	}
 	defer rt.Close()
 
-	// Verify Docker is available
 	if err := rt.Ping(ctx); err != nil {
 		return fmt.Errorf("Docker not available: %w", err)
 	}
@@ -148,18 +136,36 @@ func run(ctx context.Context, cfg *Config) error {
 	}
 	defer host.Close()
 
-	// Print listening addresses
 	log.Println("Listening on:")
 	for _, addr := range host.Addrs() {
 		log.Printf("  %s/p2p/%s", addr, host.ID())
 	}
 
-	// 6. Register protocol handlers
+	// 6. Connect to gateway (if specified)
+	var tunnelClient *tunnel.Client
+	if cfg.GatewayAddr != "" {
+		log.Printf("Connecting to gateway: %s", cfg.GatewayAddr)
+		tunnelClient = tunnel.NewClient(&tunnel.ClientConfig{
+			GatewayAddr: cfg.GatewayAddr,
+			PeerID:      id.PeerID.String(),
+		})
+		if err := tunnelClient.Connect(ctx); err != nil {
+			log.Printf("Warning: failed to connect to gateway: %v", err)
+			log.Println("Containers will not be publicly accessible")
+		} else {
+			defer tunnelClient.Close()
+		}
+	} else {
+		log.Println("No gateway specified - containers will only be accessible locally")
+	}
+
+	// 7. Register protocol handlers with tunnel support
 	log.Println("Registering protocol handlers...")
 	h := handler.NewHandler(sched, rt, trust, host.ID())
+	h.SetTunnelClient(tunnelClient)
 	h.RegisterHandlers(host)
 
-	// 7. Start discovery
+	// 8. Start discovery
 	log.Println("Starting peer discovery...")
 	discovery := p2p.NewDiscovery(host.Host(), trust)
 	if err := discovery.Start(ctx); err != nil {
@@ -167,13 +173,16 @@ func run(ctx context.Context, cfg *Config) error {
 	}
 	defer discovery.Stop()
 
-	// 8. Connect to known peers
+	// 9. Connect to known peers
 	go connectToKnownPeers(ctx, host, trust)
 
 	log.Println("")
 	log.Println("========================================")
 	log.Println("Peer Compute Daemon ready")
 	log.Printf("Peer ID: %s", id.PeerID)
+	if tunnelClient != nil && tunnelClient.IsConnected() {
+		log.Println("Gateway: Connected ✓")
+	}
 	log.Println("========================================")
 	log.Println("")
 	log.Println("Add this peer ID to your CLI with:")
